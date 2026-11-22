@@ -20,6 +20,7 @@
 - [DRM: Widevine and L3 CDM](#drm-widevine-and-l3-cdm)
 - [Architecture](#architecture)
 - [FAQ](#faq)
+- [Contributing](#contributing)
 - [Disclaimer](#disclaimer)
 
 ---
@@ -122,23 +123,29 @@ python pocketfm_downloader.py
 
 ## Login Flow
 
-PocketFM uses phone OTP via its Next.js backend Server Actions over HTTPS. Session saved as `pocketfm_session.json`.
+PocketFM uses phone OTP via its Next.js backend Server Actions over HTTPS. The app also auto-restores your session on launch if a valid token is already saved.
 
 ```mermaid
 sequenceDiagram
-    actor User
-    participant App as App (GUI)
-    participant SA as PocketFM Server Actions
+    actor You
+    participant GUI as PocketFM GUI
+    participant API as pocketfm.com (Next.js SA)
     participant Disk as pocketfm_session.json
 
-    User->>App: Enter phone number
-    App->>SA: SA_sendOtp(phone)
-    SA-->>User: SMS OTP delivered
-    User->>App: Enter OTP
-    App->>SA: SA_verifyOtp(phone, otp)
-    SA-->>App: access_token + user data (JWT)
-    App->>Disk: Save pocketfm_session.json
-    App-->>User: Logged in (phone masked in UI)
+    alt Session file exists
+        GUI->>Disk: Load token
+        Disk-->>GUI: access_token + expiry
+        GUI-->>You: Restored -- logged in as +91xxxxx89
+    else Fresh login
+        You->>GUI: Enter phone number
+        GUI->>API: SA_sendOtp(phone)
+        API-->>You: SMS OTP
+        You->>GUI: Enter OTP
+        GUI->>API: SA_verifyOtp(phone, otp)
+        API-->>GUI: access_token + user profile
+        GUI->>Disk: Write pocketfm_session.json
+        GUI-->>You: Logged in -- phone masked in UI
+    end
 ```
 
 **Session details:**
@@ -153,34 +160,41 @@ sequenceDiagram
 
 ```mermaid
 flowchart TD
-    A([Paste PocketFM URL]) --> B{URL type?}
-    B -->|Episode URL| C[Fetch single episode stream]
-    B -->|Show URL| D[Fetch show metadata + all episodes]
-    D --> E[Episode picker popup]
-    E --> F[Select episodes by range or all]
-    C --> G[Resolve MPEG-DASH MPD URL]
-    F --> G
+    A([Paste URL]) --> B{What kind?}
 
-    G --> H{DRM?}
-    H -->|yes - CENC| I[Extract Widevine PSSH from MPD]
-    H -->|no| J[Skip key fetch]
+    B -->|Episode URL| C[Fetch single episode via SA]
+    B -->|Show URL| D[Fetch show info via SA]
 
-    I --> K[pywidevine CDM + POST to PocketFM license endpoint]
-    K --> L[KID:KEY pairs extracted]
+    D --> E[Pull full episode list]
+    E --> F[/Episode picker popup\]
+    F --> G{How many?}
+    G -->|Range| H[e.g. 1-10]
+    G -->|All| I[Every episode]
+    G -->|Unfinished| J[Skip already downloaded]
 
-    J --> M[Pick quality in GUI]
-    L --> M
-    M --> N[720p / 480p / 144p]
+    C --> K[Resolve MPEG-DASH MPD]
+    H --> K
+    I --> K
+    J --> K
 
-    N --> O[N_m3u8DL-RE -- 16 threads -- sv res=WxH]
-    O --> P[mp4decrypt -- key KID:KEY]
-    P --> Q([.mkv saved to output folder])
+    K --> L{CENC encrypted?}
+    L -->|Yes| M[Extract PSSH from MPD]
+    L -->|No| P
 
-    style A fill:#1f6feb,color:#fff,stroke:none
-    style Q fill:#238636,color:#fff,stroke:none
-    style I fill:#0d1117,stroke:#9c36b5,color:#d2a8ff
-    style H fill:#0d1117,stroke:#d29922,color:#d29922
-    style O fill:#0d1117,stroke:#1f6feb,color:#79c0ff
+    M --> N[pywidevine challenge]
+    N --> O[POST license -- get KID:KEY]
+    O --> P[Quality select -- 720p 480p 144p]
+
+    P --> Q[N_m3u8DL-RE -- 16 threads]
+    Q --> R[mp4decrypt -- CENC decrypt]
+    R --> S([MKV saved to Downloads/PocketFM/])
+
+    style A fill:#238636,color:#fff,stroke:none
+    style S fill:#1f6feb,color:#fff,stroke:none
+    style M fill:#6e40c9,color:#fff,stroke:none
+    style O fill:#6e40c9,color:#fff,stroke:none
+    style L fill:#9e6a03,color:#fff,stroke:none
+    style G fill:#9e6a03,color:#fff,stroke:none
 ```
 
 ---
@@ -194,29 +208,32 @@ PocketFM protects its video content with **Widevine CENC DRM**. Encrypted stream
 ### Key extraction flow
 
 ```mermaid
-flowchart TD
-    A([MPD URL]) --> B[Parse ContentProtection elements -- look for Widevine system ID edef8ba9]
-    B --> C{PSSH found?}
-    C -->|yes| D[Use PSSH blob from MPD]
-    C -->|no| E[Construct PSSH from KID in manifest]
+flowchart LR
+    A([MPD manifest]) --> B[Scan ContentProtection\nfor Widevine UUID\nedef8ba9...]
 
-    D --> F[pywidevine CDM -- load your device.wvd]
+    B --> C{PSSH in MPD?}
+    C -->|found| D[Use raw PSSH blob]
+    C -->|missing| E[Build PSSH\nfrom KID in AdaptationSet]
+
+    D --> F[Load .wvd CDM\nvia pywidevine]
     E --> F
-    F --> G[Generate Widevine license challenge]
 
-    G --> H[POST to PocketFM Widevine license endpoint]
-    H --> I[Parse license response]
-    I --> J[KID:KEY pairs extracted -- hex, 32 chars each]
+    F --> G[Generate\nlicense challenge]
+    G --> H[POST to\nPocketFM license URL\nBearer token + challenge]
 
-    J --> K[N_m3u8DL-RE downloads all segments]
-    K --> L[mp4decrypt -- key KID:KEY -- decrypt segments]
-    L --> M[ffmpeg mux -- video + audio into .mkv]
-    M --> N([Decrypted .mkv output])
+    H --> I[Parse binary\nlicense response]
+    I --> J[Extract KID:KEY pairs\n32-char hex each]
 
-    style A fill:#1f6feb,color:#fff,stroke:none
+    J --> K[Pass --key flags\nto N_m3u8DL-RE]
+    K --> L[Segments download\nencrypted]
+    L --> M[mp4decrypt\napplies keys]
+    M --> N([Clear .mkv])
+
+    style A fill:#0d1117,stroke:#58a6ff,color:#58a6ff
     style N fill:#238636,color:#fff,stroke:none
-    style F fill:#0d1117,stroke:#9c36b5,color:#d2a8ff
-    style H fill:#0d1117,stroke:#f85149,color:#ffa198
+    style F fill:#6e40c9,color:#fff,stroke:none
+    style H fill:#da3633,color:#fff,stroke:none
+    style J fill:#9e6a03,color:#fff,stroke:none
 ```
 
 ### L3 CDM is required for DRM content
@@ -241,43 +258,51 @@ Once you have the file:
 
 ```mermaid
 flowchart TD
-    subgraph GUI["GUI Layer (Tkinter)"]
-        L[Login Tab]
-        D[Download Tab]
-        S[Settings Tab]
+    subgraph UI["Tkinter GUI"]
+        direction LR
+        T1[Login Tab]
+        T2[Download Tab]
+        T3[Settings Tab]
     end
 
-    subgraph AUTH["Auth Layer"]
-        OTP[send_otp / verify_otp]
-        SS[save_session / load_session]
-        MASK[phone masking for display]
+    subgraph SESSION["Session Layer"]
+        S1[OTP send / verify]
+        S2[Token save / restore]
+        S3[Phone mask for display]
     end
 
-    subgraph FETCH["Stream Fetch Layer"]
-        URL[URL parser -- episode vs show]
-        EP[episode picker popup]
-        MPD[MPD manifest parser]
-        PSSH[PSSH extractor]
+    subgraph CONTENT["Content Layer"]
+        C1[URL classifier\nepisode vs show]
+        C2[Episode list fetcher]
+        C3[Picker popup\nrange / all / unfinished]
+        C4[MPD resolver]
     end
 
     subgraph DRM["DRM Layer"]
-        WK[get_widevine_keys -- pywidevine]
-        LIC[POST to license endpoint]
+        D1[PSSH extractor]
+        D2[pywidevine CDM]
+        D3[License POST]
+        D4[KID KEY parser]
     end
 
-    subgraph ENGINE["Download Engine"]
-        NM[N_m3u8DL-RE -- 16 threads]
-        DEC[mp4decrypt -- CENC decrypt]
-        MUX[ffmpeg mux to .mkv]
+    subgraph DOWNLOAD["Download Engine"]
+        E1[N_m3u8DL-RE\n16 threads]
+        E2[mp4decrypt\nCENC decrypt]
+        E3[Output\nDownloads/PocketFM/]
     end
 
-    GUI --> AUTH
-    GUI --> FETCH
-    GUI --> ENGINE
-    FETCH --> DRM
-    ENGINE --> NM
-    NM --> DEC
-    DEC --> MUX
+    UI --> SESSION
+    UI --> CONTENT
+    CONTENT --> DRM
+    CONTENT --> DOWNLOAD
+    DRM --> DOWNLOAD
+    E1 --> E2 --> E3
+
+    style UI fill:#0d1117,stroke:#58a6ff,color:#cdd9e5
+    style SESSION fill:#0d1117,stroke:#3fb950,color:#cdd9e5
+    style CONTENT fill:#0d1117,stroke:#d29922,color:#cdd9e5
+    style DRM fill:#0d1117,stroke:#9c36b5,color:#cdd9e5
+    style DOWNLOAD fill:#0d1117,stroke:#238636,color:#cdd9e5
 ```
 
 ---
@@ -327,6 +352,17 @@ Yes. Paste the show URL, hit Fetch Qualities, and use the episode picker to sele
 - The `.wvd` CDM file is sensitive. Do not share it.
 - Downloads are saved as `.mkv` containers by default.
 - DRM keys are content-specific. They are only valid during your active download session.
+
+---
+
+## Contributing
+
+Open source, contributions welcome.
+
+- Fork the repo, make your changes, open a PR
+- Keep it clean, no bloat
+- Bug fixes, new platform support, quality-of-life improvements -- all good
+- Open an issue before big refactors so we can align first
 
 ---
 
